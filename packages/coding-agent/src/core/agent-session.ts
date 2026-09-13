@@ -275,6 +275,8 @@ export class AgentSession {
 	// Event subscription state
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
+	/** Serializes prompt startup so two callers cannot both dispatch a run into the same window. */
+	private _promptStartLock: Promise<void> | undefined;
 
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
 	private _steeringMessages: string[] = [];
@@ -982,6 +984,37 @@ export class AgentSession {
 	// Prompting
 	// =========================================================================
 
+	/**
+	 * Serialize prompt startup.
+	 *
+	 * `prompt()` performs async preflight (input hooks, compaction, before_agent_start)
+	 * before it dispatches a run. Without this lock, two prompts arriving in the same
+	 * tick both observe an idle session, both run preflight, and the second reaches
+	 * `Agent.prompt()` while the first run is active, where it throws
+	 * "Agent is already processing a prompt" and is silently dropped (the extension
+	 * `sendUserMessage` surface is fire-and-forget). Holding the lock until the run
+	 * has started makes the next caller observe `isStreaming` and queue via
+	 * steer()/followUp() instead of racing.
+	 */
+	private async _acquirePromptStartLock(): Promise<() => void> {
+		while (this._promptStartLock) {
+			await this._promptStartLock;
+		}
+
+		let resolveLock: () => void = () => {};
+		const lock = new Promise<void>((resolve) => {
+			resolveLock = resolve;
+		});
+		this._promptStartLock = lock;
+
+		return () => {
+			if (this._promptStartLock === lock) {
+				this._promptStartLock = undefined;
+			}
+			resolveLock();
+		};
+	}
+
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
 		try {
 			await this.agent.prompt(messages);
@@ -1037,6 +1070,8 @@ export class AgentSession {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
+		let runPromise: Promise<void> | undefined;
+		let releasePromptStartLock: (() => void) | undefined;
 
 		try {
 			// Handle extension commands first (execute immediately, even during streaming)
@@ -1049,6 +1084,10 @@ export class AgentSession {
 					return;
 				}
 			}
+
+			// Serialize startup: the lock is held through preflight and until the run has
+			// synchronously set its streaming state, so a concurrent prompt observes it.
+			releasePromptStartLock = await this._acquirePromptStartLock();
 
 			// Emit input event for extension interception (before skill/template expansion)
 			let currentText = text;
@@ -1170,17 +1209,21 @@ export class AgentSession {
 				this._systemPromptOverride = undefined;
 				this.agent.state.systemPrompt = this._baseSystemPrompt;
 			}
+
+			// Dispatch inside the lock: `_runAgentPrompt` sets streaming state
+			// synchronously, so the next waiting caller queues instead of racing.
+			if (messages) {
+				preflightResult?.(true);
+				runPromise = this._runAgentPrompt(messages);
+			}
 		} catch (error) {
 			preflightResult?.(false);
 			throw error;
+		} finally {
+			releasePromptStartLock?.();
 		}
 
-		if (!messages) {
-			return;
-		}
-
-		preflightResult?.(true);
-		await this._runAgentPrompt(messages);
+		await runPromise;
 	}
 
 	/**
